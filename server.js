@@ -5,11 +5,152 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readProvider } from './lib/gbfs.js';
-import { PROVIDERS } from './lib/providers.js';
+
+// Liest einen GBFS-Feed (Version 2.x oder 3.x) und macht daraus eine einheitliche Liste von E-Rollern.
+// GBFS ist das Standardformat, in dem Sharing-Anbieter ihre freien Fahrzeuge veröffentlichen.
+
+const UA = `RollerCheck/0.1 (${process.env.CONTACT_EMAIL || 'kein Kontakt eingetragen'})`;
+
+async function getJson(url, headers = {}, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': UA, ...headers },
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} bei ${url}`);
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// gbfs.json listet, wo die einzelnen Feeds liegen. v2: data.<sprache>.feeds, v3: data.feeds
+function pickFeeds(disc) {
+  const d = disc?.data || {};
+  let list = d.feeds;
+  if (!list) {
+    const lang = d.de || d.en || d[Object.keys(d)[0]];
+    list = lang?.feeds;
+  }
+  const out = {};
+  for (const f of list || []) out[f.name] = f.url;
+  return out;
+}
+
+// price = Entsperren, per_min_pricing = Minutenpreis (gilt für GBFS 2.x und 3.x)
+function planOf(p) {
+  const segs = p.per_min_pricing || [];
+  const seg = segs.find((s) => Number(s.start) === 0) || segs[0];
+  const perMin = seg ? Number(seg.rate) / Number(seg.interval || 1) : null;
+  return {
+    id: p.plan_id,
+    unlock: Number.isFinite(Number(p.price)) ? Number(p.price) : 0,
+    perMin: Number.isFinite(perMin) ? perMin : null,
+    currency: p.currency || 'EUR',
+  };
+}
+
+async function readProvider(cfg) {
+  const headers = cfg.headers || {};
+  const disc = await getJson(cfg.discovery, headers).catch(() => null);
+  const feeds = pickFeeds(disc);
+  const base = cfg.discovery.replace(/\/gbfs\.json(\?.*)?$/, '');
+  const url = (name) => feeds[name] || `${base}/${name}.json`;
+  // GBFS 3 heißt der Feed vehicle_status, GBFS 2 free_bike_status
+  const vehicleFeed = feeds.vehicle_status ? 'vehicle_status' : 'free_bike_status';
+
+  const [veh, plansRaw, typesRaw] = await Promise.all([
+    getJson(url(vehicleFeed), headers),
+    getJson(url('system_pricing_plans'), headers).catch(() => null),
+    getJson(url('vehicle_types'), headers).catch(() => null),
+  ]);
+
+  const plans = new Map((plansRaw?.data?.plans || []).map((p) => [p.plan_id, planOf(p)]));
+  const types = typesRaw?.data?.vehicle_types || [];
+  const scooterTypes = new Set(
+    types.filter((t) => String(t.form_factor || '').startsWith('scooter')).map((t) => t.vehicle_type_id),
+  );
+  const typePlan = new Map(
+    types.map((t) => [t.vehicle_type_id, t.default_pricing_plan_id || (t.default_pricing_plan_ids || [])[0]]),
+  );
+
+  const list = veh?.data?.vehicles || veh?.data?.bikes || [];
+  const scooters = [];
+  const planCount = new Map();
+  for (const v of list) {
+    if (v.is_disabled || v.is_reserved) continue;
+    const lat = Number(v.lat);
+    const lon = Number(v.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    // Nur Roller, keine Fahrräder (wenn der Anbieter die Fahrzeugtypen mitliefert)
+    if (scooterTypes.size && !scooterTypes.has(v.vehicle_type_id)) continue;
+
+    const planId = v.pricing_plan_id || typePlan.get(v.vehicle_type_id);
+    planCount.set(planId, (planCount.get(planId) || 0) + 1);
+
+    const fuel = Number(v.current_fuel_percent);
+    const range = Number(v.current_range_meters);
+    scooters.push({
+      id: String(v.bike_id ?? v.vehicle_id),
+      lat,
+      lon,
+      bat: Number.isFinite(fuel) && v.current_fuel_percent != null ? Math.round(fuel <= 1 ? fuel * 100 : fuel) : null,
+      rangeM: Number.isFinite(range) && v.current_range_meters != null ? Math.round(range) : null,
+      // Direkt-Links in die Anbieter-App (iOS/Android), wenn der Anbieter sie mitliefert
+      uris: v.rental_uris ? { android: v.rental_uris.android, ios: v.rental_uris.ios, web: v.rental_uris.web } : null,
+    });
+  }
+
+  // Der Preisplan, der bei den meisten Rollern gilt, ist der Standardpreis des Anbieters
+  let mainPlanId = [...planCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  if (!plans.has(mainPlanId)) mainPlanId = [...plans.keys()][0];
+  const main = plans.get(mainPlanId);
+  const pricing = main && main.perMin != null ? { unlock: main.unlock, perMin: main.perMin, currency: main.currency } : null;
+
+  return { scooters, pricing, ttlMs: Number(veh?.ttl || 0) * 1000, lastUpdated: veh?.last_updated ?? null };
+}
+
+// Welche Anbieter der Server abfragt. Einen neuen Anbieter einzubauen heißt: einen Eintrag mit der gbfs.json-Adresse ergänzen.
+//
+// Stand der Recherche (November 2026):
+//  - Dott:  öffentlicher GBFS-2.3-Feed für Hannover, ohne Schlüssel. Enthält Positionen, Akku, Preise und App-Links. Gelesen und bestätigt.
+//  - Lime:  hat öffentliche GBFS-Feeds (data.lime.bike). Die Adresse für Hannover ("hannover") ist geraten und nicht bestätigt.
+//  - Voi:   GBFS nur mit API-Key (Partnerprogramm). Ohne VOI_API_KEY und VOI_ZONE_ID bleibt Voi aus.
+//  - Bolt, Ryde: keinen öffentlichen Feed gefunden.
+
+const voiKey = process.env.VOI_API_KEY;
+const voiZone = process.env.VOI_ZONE_ID;
+
+const PROVIDERS = [
+  {
+    id: 'dott',
+    name: 'Dott',
+    enabled: true,
+    discovery: 'https://gbfs.api.ridedott.com/public/v2/hannover/gbfs.json',
+  },
+  {
+    id: 'lime',
+    name: 'Lime',
+    enabled: process.env.LIME !== 'off',
+    discovery: 'https://data.lime.bike/api/partners/v2/gbfs/hannover/gbfs.json',
+    note: 'Adresse für Hannover nicht bestätigt',
+  },
+  {
+    id: 'voi',
+    name: 'Voi',
+    enabled: Boolean(voiKey && voiZone),
+    discovery: `https://api.voiapp.io/v1/partner-apis/gbfs/${voiZone}/gbfs.json`,
+    headers: { 'X-Access-Token': voiKey || '' },
+    note: 'Braucht einen API-Key von Voi',
+  },
+  { id: 'bolt', name: 'Bolt', enabled: false, discovery: '', note: 'Kein öffentlicher Feed gefunden' },
+  { id: 'ryde', name: 'Ryde', enabled: false, discovery: '', note: 'Kein öffentlicher Feed gefunden' },
+];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const PUB = path.join(HERE, 'public');
+const PUB = HERE;
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -145,7 +286,11 @@ export function createServer(providers = PROVIDERS, opts = {}) {
       return;
     }
     if (rel === '/' || rel === '') rel = '/index.html';
-    const file = path.normalize(path.join(PUB, rel));
+    if (rel !== '/index.html') {
+      res.writeHead(404).end('Nicht gefunden');
+      return;
+    }
+    const file = path.join(PUB, 'index.html');
     if (!file.startsWith(PUB + path.sep)) {
       res.writeHead(403).end('Verboten');
       return;
