@@ -1,0 +1,13 @@
+{
+  "name": "rollercheck-server",
+  "version": "0.1.0",
+  "description": "Holt Live-Daten von E-Roller-Anbietern (GBFS) und liefert sie an die RollerCheck-App.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/run.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
